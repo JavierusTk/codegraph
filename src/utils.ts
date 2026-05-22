@@ -47,6 +47,18 @@ const SENSITIVE_PATHS = new Set([
 ]);
 
 /**
+ * Build the prefix that a path must start with to be considered *inside* `root`.
+ *
+ * A drive or filesystem root ("W:\\", "C:\\", "/") already ends with a
+ * separator. Blindly appending `path.sep` would produce "W:\\\\", which no real
+ * path starts with — so every file under a drive-root project would be wrongly
+ * rejected as a traversal escape. Only append a separator when one is missing.
+ */
+function rootPrefix(root: string): string {
+  return root.endsWith(path.sep) ? root : root + path.sep;
+}
+
+/**
  * Validate that a resolved file path stays within the project root.
  * Prevents path traversal attacks (e.g. node.filePath = "../../etc/passwd").
  *
@@ -58,7 +70,7 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
   const resolved = path.resolve(projectRoot, filePath);
   const normalizedRoot = path.resolve(projectRoot);
 
-  if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
+  if (!resolved.startsWith(rootPrefix(normalizedRoot)) && resolved !== normalizedRoot) {
     return null;
   }
   return resolved;
@@ -119,7 +131,7 @@ export function validateProjectPath(dirPath: string): string | null {
 export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
   const resolvedPath = path.resolve(rootDir, filePath);
   const resolvedRoot = path.resolve(rootDir);
-  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
+  return resolvedPath.startsWith(rootPrefix(resolvedRoot)) || resolvedPath === resolvedRoot;
 }
 
 /**
@@ -139,7 +151,7 @@ export function isPathWithinRootReal(filePath: string, rootDir: string): boolean
   try {
     const realPath = fs.realpathSync(path.resolve(rootDir, filePath));
     const realRoot = fs.realpathSync(rootDir);
-    return realPath.startsWith(realRoot + path.sep) || realPath === realRoot;
+    return realPath.startsWith(rootPrefix(realRoot)) || realPath === realRoot;
   } catch {
     // If realpath fails (broken symlink, permissions), fall back to logical check
     return true;

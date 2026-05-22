@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot, isPathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -204,6 +204,38 @@ describe('validateProjectPath — sensitive directory blocking', () => {
       expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
     }
   );
+});
+
+describe('validatePathWithinRoot / isPathWithinRoot — containment check', () => {
+  // A drive root ("W:\") or POSIX root ("/") already ends with a separator.
+  // The check used to append another, comparing against "W:\\" / "//", which
+  // no real path starts with — so every file under a drive-root project was
+  // wrongly rejected and the whole index failed with "files could not be read".
+  it.runIf(process.platform === 'win32')('accepts files when the project root is a drive root', () => {
+    expect(validatePathWithinRoot('C:\\', 'project\\src\\app.ts')).toBe('C:\\project\\src\\app.ts');
+    expect(validatePathWithinRoot('W:\\', 'CyberMAX\\Source\\foo.pas')).toBe('W:\\CyberMAX\\Source\\foo.pas');
+    expect(isPathWithinRoot('W:\\CyberMAX\\Source\\foo.pas', 'W:\\')).toBe(true);
+  });
+
+  it.runIf(process.platform !== 'win32')('accepts files when the project root is the filesystem root', () => {
+    expect(validatePathWithinRoot('/', 'project/src/app.ts')).toBe('/project/src/app.ts');
+    expect(isPathWithinRoot('/project/src/app.ts', '/')).toBe(true);
+  });
+
+  it('still works for a normal nested project root', () => {
+    const root = path.join(os.tmpdir(), 'cg-root');
+    expect(validatePathWithinRoot(root, 'src/app.ts')).toBe(path.join(root, 'src', 'app.ts'));
+    expect(isPathWithinRoot(path.join(root, 'src', 'app.ts'), root)).toBe(true);
+  });
+
+  it('still rejects traversal escapes and sibling-prefix paths', () => {
+    const root = path.join(os.tmpdir(), 'cg-root');
+    // Classic traversal escape.
+    expect(validatePathWithinRoot(root, path.join('..', 'escape', 'x.ts'))).toBeNull();
+    // Sibling directory that shares a name prefix (cg-root vs cg-root-evil)
+    // must not be treated as inside — the trailing separator guards this.
+    expect(isPathWithinRoot(`${root}-evil${path.sep}x.ts`, root)).toBe(false);
+  });
 });
 
 describe('MCP Input Validation', () => {
