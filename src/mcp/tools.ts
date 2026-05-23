@@ -303,7 +303,7 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_context instead for comprehensive task context.',
+    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_context instead for comprehensive task context. By default, `import` and `export` nodes (uses-clause references) are filtered out so a search for a frequently-imported symbol surfaces the definition, not the import sites — pass `includeImports: true` to opt back in. Multiple overloads of the same symbol in the same file are grouped into one entry by default — pass `groupOverloads: false` to opt out.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -320,6 +320,16 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum results (default: 10)',
           default: 10,
+        },
+        includeImports: {
+          type: 'boolean',
+          description: 'Include `import`/`export` (uses-clause) nodes in results. Default false — they dump full multi-line `uses` clauses and rarely answer "where is X defined?". Set true when you specifically want to find import sites.',
+          default: false,
+        },
+        groupOverloads: {
+          type: 'boolean',
+          description: 'Collapse multiple results with the same (name, filePath, kind) into one entry that lists all signatures grouped by line. Default true — common for Pascal/Delphi overloads. Set false for flat per-signature listing.',
+          default: true,
         },
         projectPath: projectPathProperty,
       },
@@ -753,17 +763,34 @@ export class ToolHandler {
     const kind = args.kind as string | undefined;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
+    const includeImports = args.includeImports === true;
+    // Default true — Pascal/Delphi overloads collapse cleanly; only opt out
+    // when the agent specifically wants per-signature listing.
+    const groupOverloads = args.groupOverloads !== false;
 
-    const results = cg.searchNodes(query, {
-      limit,
+    // When we'll filter or group, fetch extra candidates so the final
+    // post-filter slice still has ~`limit` items. Bounded at 300 so a
+    // pathological query (filtered=true on a name that only matches
+    // imports) doesn't trigger a giant FTS scan.
+    const willPostProcess = !includeImports || groupOverloads;
+    const internalLimit = willPostProcess ? Math.min(limit * 3, 300) : limit;
+
+    let results = cg.searchNodes(query, {
+      limit: internalLimit,
       kinds: kind ? [kind as NodeKind] : undefined,
     });
+
+    if (!includeImports) {
+      results = results.filter(
+        (r) => r.node.kind !== 'import' && r.node.kind !== 'export'
+      );
+    }
 
     if (results.length === 0) {
       return this.textResult(`No results found for "${query}"`);
     }
 
-    const formatted = this.formatSearchResults(results);
+    const formatted = this.formatSearchResults(results, { groupOverloads, limit });
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -1831,17 +1858,69 @@ export class ToolHandler {
   // Formatting helpers (compact by default to reduce context usage)
   // =========================================================================
 
-  private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`## Search Results (${results.length} found)`, ''];
+  private formatSearchResults(
+    results: SearchResult[],
+    opts?: { groupOverloads?: boolean; limit?: number }
+  ): string {
+    const groupOverloads = opts?.groupOverloads !== false;
+    const limit = opts?.limit ?? results.length;
 
-    for (const result of results) {
-      const { node } = result;
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact format: one line per result with key info
-      lines.push(`### ${node.name} (${node.kind})`);
-      lines.push(`${node.filePath}${location}`);
-      if (node.signature) lines.push(`\`${node.signature}\``);
-      lines.push('');
+    // Group by (name, filePath, kind). Preserves first-seen order so the most
+    // relevant entry stays on top. Within a group, sub-entries are sorted by
+    // startLine for canonical reading order (matches the source file order).
+    interface Group {
+      name: string;
+      kind: string;
+      filePath: string;
+      entries: SearchResult[];
+    }
+    const groups: Group[] = [];
+    const byKey = new Map<string, Group>();
+
+    for (const r of results) {
+      const { node } = r;
+      const key = groupOverloads
+        ? `${node.name}|${node.filePath}|${node.kind}`
+        : `${node.name}|${node.filePath}|${node.kind}|${node.startLine ?? '?'}`;
+      let g = byKey.get(key);
+      if (!g) {
+        g = { name: node.name, kind: node.kind, filePath: node.filePath, entries: [] };
+        byKey.set(key, g);
+        groups.push(g);
+      }
+      g.entries.push(r);
+    }
+
+    // Sort within-group entries by startLine (stable for absent lines).
+    for (const g of groups) {
+      g.entries.sort((a, b) => (a.node.startLine ?? 0) - (b.node.startLine ?? 0));
+    }
+
+    // Cap to caller's limit AFTER grouping — that's what the agent asked for.
+    const shown = groups.slice(0, limit);
+    const lines: string[] = [`## Search Results (${shown.length} found)`, ''];
+
+    for (const g of shown) {
+      if (g.entries.length === 1 || !groupOverloads) {
+        const e = g.entries[0];
+        if (!e) continue; // unreachable — group always has at least one entry; satisfies TS
+        const { node } = e;
+        const location = node.startLine ? `:${node.startLine}` : '';
+        lines.push(`### ${node.name} (${node.kind})`);
+        lines.push(`${node.filePath}${location}`);
+        if (node.signature) lines.push(`\`${node.signature}\``);
+        lines.push('');
+      } else {
+        // Multiple entries collapsed into one group.
+        lines.push(`### ${g.name} (${g.kind}) — ${g.entries.length} overloads`);
+        lines.push(g.filePath);
+        for (const e of g.entries) {
+          const loc = e.node.startLine ? `:${e.node.startLine}` : '';
+          const sig = e.node.signature ? ` \`${e.node.signature}\`` : '';
+          lines.push(`  ${loc}${sig}`);
+        }
+        lines.push('');
+      }
     }
 
     return lines.join('\n');
