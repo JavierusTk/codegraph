@@ -578,6 +578,29 @@ describe('Symlink Cycle Detection', () => {
     expect(files.some(f => f.includes('hello.ts'))).toBe(true);
   });
 
+  it('should follow directory symlinks whose real target is outside the project root', () => {
+    const externalDir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(externalDir, 'external-unit.ts'), 'export const externalUnit = 1;\n');
+
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir);
+      try {
+        fs.symlinkSync(externalDir, path.join(srcDir, 'linked-external'), 'dir');
+      } catch {
+        return;
+      }
+
+      const files = scanDirectory(tempDir);
+
+      // Mirrors Windows drive-to-drive directory links: the real target can be
+      // outside the project root, but the indexed logical path stays inside it.
+      expect(files).toContain('src/linked-external/external-unit.ts');
+    } finally {
+      cleanupTempDir(externalDir);
+    }
+  });
+
   it('should skip broken symlinks gracefully', () => {
     const srcDir = path.join(tempDir, 'src');
     fs.mkdirSync(srcDir);

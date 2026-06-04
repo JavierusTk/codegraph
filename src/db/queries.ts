@@ -974,8 +974,20 @@ export class QueryBuilder {
     // so treat it as whitespace before the strip step. Otherwise queries
     // like `stage_apply::run` collapse to `stage_applyrun` (the colons
     // are stripped without splitting) and find nothing. See #173.
+    //
+    // `.` between letters is the member-access / qualifier separator in
+    // Pascal (`TForm.Show`, `Application.Initialize`), Python
+    // (`module.func`), TypeScript (`namespace.foo`), and matches the unit-
+    // segment separator in Delphi/Embarcadero unit names (`Vcl.Forms.pas`).
+    // The unicode61 FTS5 tokenizer already splits on `.` when indexing,
+    // so the indexed `Application.Initialize` becomes tokens
+    // `application` + `initialize`; without splitting the query the same
+    // way, a phrase like `"Application.Initialize"*` won't match.
+    // Restricted to letter-on-both-sides so version strings (`1.5`,
+    // `2.0.1`) are left untouched.
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
+      .replace(/([A-Za-z])\.([A-Za-z])/g, '$1 $2') // member-access dot
       .replace(/['"*():^]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)
