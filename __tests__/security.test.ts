@@ -313,6 +313,7 @@ describe('MCP Input Validation', () => {
         startLine: 1,
         endLine: 2,
         language: 'typescript',
+        signature: `function symbol_${i}_${'x'.repeat(300)}(): void`,
       },
       score: 1,
     }));
@@ -321,7 +322,7 @@ describe('MCP Input Validation', () => {
     };
     const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
 
-    const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
+    const result = await fakeHandler.execute('codegraph_search', { query: 'x', limit: 100 });
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('... (output truncated)');
