@@ -698,6 +698,7 @@ program
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
+      const fts5Available = cg.hasFts5();
 
       // JSON output mode
       if (options.json) {
@@ -713,6 +714,7 @@ program
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
           backend,
+          fts5Available,
           journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
@@ -744,9 +746,10 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
-      // Surface the active SQLite backend (node:sqlite — Node's built-in real
-      // SQLite, full WAL + FTS5, no native build).
-      const backendLabel = chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`);
+      // Surface the active SQLite backend and runtime FTS5 availability.
+      const backendLabel = chalk.green(
+        `node:sqlite ${getGlyphs().dash} built-in (${fts5Available ? 'WAL + FTS5' : 'WAL, no FTS5'})`
+      );
       console.log(`  Backend:   ${backendLabel}`);
       // Effective journal mode: 'wal' means concurrent reads never block on a
       // writer; anything else means they can ("database is locked"). node:sqlite

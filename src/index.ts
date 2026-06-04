@@ -656,6 +656,15 @@ export class CodeGraph {
   }
 
   /**
+   * Whether the active SQLite runtime supports FTS5 virtual tables. If false,
+   * text search still works through the LIKE/fuzzy fallback path, but without
+   * BM25 ranking.
+   */
+  hasFts5(): boolean {
+    return this.db.hasFts5();
+  }
+
+  /**
    * The journal mode actually in effect ('wal', 'delete', …). 'wal' means
    * readers never block on a concurrent writer; anything else means they can,
    * which is the precondition for the "database is locked" failures in issue

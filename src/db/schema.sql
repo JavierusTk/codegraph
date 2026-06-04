@@ -93,35 +93,6 @@ CREATE INDEX IF NOT EXISTS idx_nodes_language ON nodes(language);
 CREATE INDEX IF NOT EXISTS idx_nodes_file_line ON nodes(file_path, start_line);
 CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
 
--- Full-text search index on node names, docstrings, and signatures
-CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-    id,
-    name,
-    qualified_name,
-    docstring,
-    signature,
-    content='nodes',
-    content_rowid='rowid'
-);
-
--- Triggers to keep FTS index in sync
-CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-    INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
-    VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
-END;
-
-CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature)
-    VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
-END;
-
-CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, name, qualified_name, docstring, signature)
-    VALUES ('delete', OLD.rowid, OLD.id, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
-    INSERT INTO nodes_fts(rowid, id, name, qualified_name, docstring, signature)
-    VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
-END;
-
 -- Edge indexes.
 -- idx_edges_source / idx_edges_target are intentionally omitted —
 -- the (source, kind) and (target, kind) composites below cover the

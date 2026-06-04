@@ -36,6 +36,36 @@ function configureConnection(db: SqliteDatabase): void {
   db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
 }
 
+function hasFts5(db: SqliteDatabase): boolean {
+  try {
+    db.exec('CREATE VIRTUAL TABLE temp.__codegraph_fts5_probe USING fts5(value)');
+    db.exec('DROP TABLE temp.__codegraph_fts5_probe');
+    return true;
+  } catch {
+    try {
+      db.exec('DROP TABLE IF EXISTS temp.__codegraph_fts5_probe');
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+}
+
+function applySchema(db: SqliteDatabase): boolean {
+  const schemaPath = path.join(__dirname, 'schema.sql');
+  const schema = fs.readFileSync(schemaPath, 'utf-8');
+  db.exec(schema);
+
+  const fts5Available = hasFts5(db);
+  if (fts5Available) {
+    const ftsSchemaPath = path.join(__dirname, 'schema-fts.sql');
+    const ftsSchema = fs.readFileSync(ftsSchemaPath, 'utf-8');
+    db.exec(ftsSchema);
+  }
+
+  return fts5Available;
+}
+
 /**
  * Database connection wrapper with lifecycle management
  */
@@ -43,11 +73,18 @@ export class DatabaseConnection {
   private db: SqliteDatabase;
   private dbPath: string;
   private backend: SqliteBackend;
+  private fts5Available: boolean;
 
-  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
+  private constructor(
+    db: SqliteDatabase,
+    dbPath: string,
+    backend: SqliteBackend,
+    fts5Available: boolean
+  ) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
+    this.fts5Available = fts5Available;
   }
 
   /**
@@ -65,10 +102,9 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
-    // Run schema initialization
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-    db.exec(schema);
+    // Run schema initialization. FTS5 is optional because some node:sqlite
+    // builds omit that SQLite module; search falls back to LIKE when absent.
+    const fts5Available = applySchema(db);
 
     // Record current schema version so migrations aren't re-applied on open
     const currentVersion = getCurrentVersion(db);
@@ -78,7 +114,7 @@ export class DatabaseConnection {
       ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
     }
 
-    return new DatabaseConnection(db, dbPath, backend);
+    return new DatabaseConnection(db, dbPath, backend, fts5Available);
   }
 
   /**
@@ -93,8 +129,10 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
+    const fts5Available = hasFts5(db);
+
     // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend);
+    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available);
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -118,6 +156,13 @@ export class DatabaseConnection {
    */
   getBackend(): SqliteBackend {
     return this.backend;
+  }
+
+  /**
+   * Whether the active SQLite runtime supports FTS5 virtual tables.
+   */
+  hasFts5(): boolean {
+    return this.fts5Available;
   }
 
   /**

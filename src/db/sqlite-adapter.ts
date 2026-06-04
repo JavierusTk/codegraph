@@ -5,9 +5,11 @@
  * through a small better-sqlite3-shaped interface so the rest of the codebase
  * is storage-agnostic.
  *
- * CodeGraph ships with a bundled Node runtime, so `node:sqlite` (real SQLite,
- * with WAL + FTS5) is always available — there is no native build step and no
- * wasm fallback. When run from source instead, it requires Node >= 22.5.
+ * CodeGraph ships with a bundled Node runtime, so `node:sqlite` (real SQLite)
+ * is always available — there is no native build step and no wasm fallback.
+ * Some source-install Node builds omit FTS5; the DB layer detects that and the
+ * query layer falls back to LIKE search. When run from source instead, it
+ * requires Node >= 22.5.
  */
 
 export interface SqliteStatement {
@@ -42,10 +44,11 @@ export type SqliteBackend = 'node-sqlite';
  * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
  * better-sqlite3 interface the rest of the code expects.
  *
- * node:sqlite is real SQLite compiled into Node, so it supports WAL, FTS5,
- * mmap, and `@named` params natively — the only shims needed are the
- * better-sqlite3 conveniences node:sqlite omits: a `.pragma()` helper, a
- * `.transaction()` helper, and `open` (node:sqlite exposes `isOpen`).
+ * node:sqlite is real SQLite compiled into Node, so it supports WAL, mmap, and
+ * `@named` params natively. FTS5 depends on the Node build's SQLite compile
+ * options, so schema initialization probes it at runtime. The only shims needed
+ * are the better-sqlite3 conveniences node:sqlite omits: a `.pragma()` helper,
+ * a `.transaction()` helper, and `open` (node:sqlite exposes `isOpen`).
  */
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;

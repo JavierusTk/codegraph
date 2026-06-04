@@ -1729,6 +1729,8 @@ func main() {
     // feature can't silently regress to a no-op in the indexing flow.
     it('connects #include to the real header file via include-dir scan (end-to-end)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-e2e-'));
+      let e2eCg: CodeGraph | undefined;
+      let db: DatabaseConnection | undefined;
       try {
         fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
         fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
@@ -1742,16 +1744,16 @@ func main() {
         );
 
         clearCppIncludeDirCache();
-        cg = await CodeGraph.init(tempProject, { index: true });
+        e2eCg = await CodeGraph.init(tempProject, { index: true });
 
         // Sanity: file nodes exist for the header and the cpp.
-        const allFiles = cg.getStats();
+        const allFiles = e2eCg.getStats();
         expect(allFiles.fileCount).toBe(2);
 
         // The `#include "utils.h"` edge should target the real
         // `include/utils.h` file node — not a floating `import` node
         // living inside main.cpp.
-        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
         const rows = db.getDb().prepare(`
           select dst.kind as dstKind, dst.file_path as dstPath
           from edges e
@@ -1771,6 +1773,8 @@ func main() {
         );
         expect(stdlibFile).toBeUndefined();
       } finally {
+        db?.close();
+        e2eCg?.close();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });

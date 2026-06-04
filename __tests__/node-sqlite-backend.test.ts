@@ -2,8 +2,9 @@
  * node:sqlite backend (issue #238 follow-up).
  *
  * node:sqlite (Node's built-in real SQLite) is now the sole backend. This drives
- * a real index + queries through it, so WAL, FTS5 search, and @named-param
- * writes are all exercised end-to-end.
+ * a real index + queries through it, so WAL, text search, and @named-param
+ * writes are all exercised end-to-end. FTS5 is runtime-dependent in Node's
+ * bundled SQLite; search falls back to LIKE when unavailable.
  *
  * Skipped on Node < 22.5 where node:sqlite doesn't exist.
  */
@@ -56,7 +57,7 @@ describe.skipIf(!nodeSqliteAvailable)('node:sqlite backend — real index + quer
     expect(stats.nodeCount).toBeGreaterThan(0);
   });
 
-  it('FTS5 search returns the indexed symbol (read path)', () => {
+  it('search returns the indexed symbol (read path)', () => {
     const results = cg.searchNodes('helper');
     const names = results.map(r => r.node.name);
     expect(names).toContain('helper');

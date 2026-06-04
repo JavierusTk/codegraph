@@ -29,6 +29,7 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [BIN, 'serve', '--mcp', '--no-watch'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -72,6 +73,25 @@ function send(child: ChildProcessWithoutNullStreams, msg: object): void {
   child.stdin.write(JSON.stringify(msg) + '\n');
 }
 
+function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const killTimer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, 1000);
+    const timeout = setTimeout(resolve, 5000);
+    child.once('exit', () => {
+      clearTimeout(killTimer);
+      clearTimeout(timeout);
+      resolve();
+    });
+    child.stdin.end();
+  });
+}
+
 const CLIENT_INFO = { name: 'test', version: '0.0.0' };
 
 describe('MCP project resolution via roots/list (issue #196)', () => {
@@ -84,13 +104,13 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      await stopChild(child);
       child = null;
     }
-    fs.rmSync(cwdDir, { recursive: true, force: true });
-    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(cwdDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    fs.rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('resolves the project from the client roots/list when no rootUri is sent', async () => {
