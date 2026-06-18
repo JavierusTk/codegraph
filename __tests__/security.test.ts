@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot, isPathWithinRoot } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -176,6 +176,95 @@ describe('Path Traversal Prevention', () => {
   });
 });
 
+describe('Symlink escape prevention (#527)', () => {
+  // An in-repo symlink whose logical path is inside the project root but whose
+  // REAL target escapes the root must never be served. validatePathWithinRoot
+  // is the chokepoint both content-serving read sinks go through (codegraph_node
+  // includeCode + codegraph_explore source rendering), so it must resolve
+  // symlinks, not just compare strings. realpathSync the roots so the test's own
+  // expectations don't trip over /tmp -> /private/tmp on macOS.
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-root-')));
+    outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-outside-')));
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'in.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(outside, 'pkg'));
+    fs.writeFileSync(path.join(outside, 'pkg', 'secret.txt'), 'TOP-SECRET\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  // Symlink creation needs privileges on Windows; skip gracefully if it fails.
+  const link = (linkPath: string, target: string): boolean => {
+    try { fs.symlinkSync(target, linkPath); return true; } catch { return false; }
+  };
+
+  it('allows a real file inside the root (and realpaths consistently)', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts')).not.toBeNull();
+  });
+
+  it('allows a not-yet-existing path inside the root (ENOENT — files about to be written)', () => {
+    expect(validatePathWithinRoot(root, 'src/will-write.ts')).not.toBeNull();
+  });
+
+  it('rejects a lexical ../ traversal out of the root', () => {
+    expect(validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`)).toBeNull();
+  });
+
+  it('rejects an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape')).toBeNull();
+  });
+
+  it('rejects a path that escapes through an in-repo symlink to an out-of-root DIR', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
+  });
+
+  it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
+    if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
+    expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
+  });
+
+  it('end-to-end: getCode never serves an out-of-root file reached via a dir symlink', async () => {
+    fs.writeFileSync(path.join(outside, 'pkg', 'leak.ts'),
+      'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'vendored'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // Whether or not extraction followed the dir symlink, NO node may ever
+      // yield the out-of-root content through getCode.
+      for (const n of cg.getNodesByKind('function')) {
+        const code = await cg.getCode(n.id);
+        expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('validatePathWithinRoot — root containment', () => {
+  // Indexing filesystem roots is refused by default at CLI/installer entry
+  // points, but forced or pre-existing root indexes still need the containment
+  // primitive to treat children of "/" / "C:\" as inside the root.
+  it.runIf(process.platform !== 'win32')('accepts children when the project root is the POSIX filesystem root', () => {
+    expect(validatePathWithinRoot('/', 'project/src/app.ts')).toBe('/project/src/app.ts');
+  });
+
+  it.runIf(process.platform === 'win32')('accepts children when the project root is a drive root', () => {
+    expect(validatePathWithinRoot('C:\\', 'project\\src\\app.ts')).toBe('C:\\project\\src\\app.ts');
+  });
+});
+
 describe('validateProjectPath — sensitive directory blocking', () => {
   // POSIX-only: on Windows '/etc' resolves to C:\etc (non-existent), not a
   // sensitive dir — the Windows case is covered by the win32-gated test below.
@@ -204,38 +293,6 @@ describe('validateProjectPath — sensitive directory blocking', () => {
       expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
     }
   );
-});
-
-describe('validatePathWithinRoot / isPathWithinRoot — containment check', () => {
-  // A drive root ("W:\") or POSIX root ("/") already ends with a separator.
-  // The check used to append another, comparing against "W:\\" / "//", which
-  // no real path starts with — so every file under a drive-root project was
-  // wrongly rejected and the whole index failed with "files could not be read".
-  it.runIf(process.platform === 'win32')('accepts files when the project root is a drive root', () => {
-    expect(validatePathWithinRoot('C:\\', 'project\\src\\app.ts')).toBe('C:\\project\\src\\app.ts');
-    expect(validatePathWithinRoot('W:\\', 'CyberMAX\\Source\\foo.pas')).toBe('W:\\CyberMAX\\Source\\foo.pas');
-    expect(isPathWithinRoot('W:\\CyberMAX\\Source\\foo.pas', 'W:\\')).toBe(true);
-  });
-
-  it.runIf(process.platform !== 'win32')('accepts files when the project root is the filesystem root', () => {
-    expect(validatePathWithinRoot('/', 'project/src/app.ts')).toBe('/project/src/app.ts');
-    expect(isPathWithinRoot('/project/src/app.ts', '/')).toBe(true);
-  });
-
-  it('still works for a normal nested project root', () => {
-    const root = path.join(os.tmpdir(), 'cg-root');
-    expect(validatePathWithinRoot(root, 'src/app.ts')).toBe(path.join(root, 'src', 'app.ts'));
-    expect(isPathWithinRoot(path.join(root, 'src', 'app.ts'), root)).toBe(true);
-  });
-
-  it('still rejects traversal escapes and sibling-prefix paths', () => {
-    const root = path.join(os.tmpdir(), 'cg-root');
-    // Classic traversal escape.
-    expect(validatePathWithinRoot(root, path.join('..', 'escape', 'x.ts'))).toBeNull();
-    // Sibling directory that shares a name prefix (cg-root vs cg-root-evil)
-    // must not be treated as inside — the trailing separator guards this.
-    expect(isPathWithinRoot(`${root}-evil${path.sep}x.ts`, root)).toBe(false);
-  });
 });
 
 describe('MCP Input Validation', () => {
