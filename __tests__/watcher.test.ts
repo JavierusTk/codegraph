@@ -419,6 +419,49 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('drive-root recursive watch — leading-separator paths', () => {
+    // Recursive fs.watch on a Windows DRIVE ROOT (e.g. `W:\`) reports filenames
+    // with a leading separator (`\.codegraph\…`, `\src\foo.ts`), unlike a normal
+    // sub-directory root. normalizePath only swaps `\`→`/`, so handleChange would
+    // receive an absolute-looking `rel` (`/.codegraph/…`); `ignore.ignores()`
+    // throws a RangeError on an absolute path, which killed the daemon on its
+    // first file event when indexing a whole drive. handleChange must strip the
+    // leading separator. Driven synthetically, so this guards the regression on
+    // every platform — not just Windows.
+    it('does not crash on a leading-separator .codegraph path (ignored, no sync)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // Pre-fix this threw `RangeError: path should be a path.relative()d string`
+      // synchronously inside ignore.ignores().
+      expect(() => __emitWatchEventForTests(testDir, '/.codegraph/codegraph.lock')).not.toThrow();
+
+      await new Promise((r) => setTimeout(r, 400));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('tracks a leading-separator source path under its project-relative form', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const watcher = newWatcher(syncFn, { debounceMs: 2000 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // `\src\live.ts` from a drive-root watch → `/src/live.ts` → stripped to
+      // `src/live.ts`, recorded as pending under the relative path.
+      __emitWatchEventForTests(testDir, '/src/live.ts');
+
+      const paths = watcher.getPendingFiles().map((p) => p.path);
+      expect(paths).toContain('src/live.ts');
+      expect(paths).not.toContain('/src/live.ts');
+
+      watcher.stop();
+    });
+  });
+
   describe('pending file tracking (#403)', () => {
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
       // Slow debounce — pending entries are visible until the debounce fires.

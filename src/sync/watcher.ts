@@ -532,6 +532,12 @@ export class FileWatcher {
    * — it drops node_modules/dist/.git churn before any sync is scheduled.
    */
   private handleChange(rel: string): void {
+    // Recursive fs.watch on a DRIVE ROOT (e.g. `W:\`) reports filenames with a
+    // leading separator, so `rel` arrives absolute-looking (`/.codegraph/…`)
+    // instead of project-relative. `ignore.ignores()` (called below) throws a
+    // RangeError on an absolute path, which would kill the watcher/daemon on the
+    // first event. Strip any leading separator so `rel` is always relative.
+    rel = rel.replace(/^\/+/, '');
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (this.isAlwaysIgnored(rel)) return;
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
