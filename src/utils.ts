@@ -125,6 +125,21 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
 }
 
 /**
+ * Resolve a path for indexer-internal filesystem reads.
+ *
+ * This performs only lexical containment. The indexer has already discovered
+ * these paths by walking the project tree, and intentionally follows vendored
+ * source directories exposed through in-root symlinks/junctions. Do not use
+ * this helper for user/agent-facing source reads; those must keep using
+ * validatePathWithinRoot so out-of-root symlink targets are never served back.
+ */
+export function resolvePathWithinRootForIndexing(projectRoot: string, filePath: string): string | null {
+  const resolved = path.resolve(projectRoot, filePath);
+  const normalizedRoot = path.resolve(projectRoot);
+  return isWithinDir(resolved, normalizedRoot) ? resolved : null;
+}
+
+/**
  * Validate that a path is a safe project root directory.
  *
  * Rejects sensitive system directories and ensures the path is

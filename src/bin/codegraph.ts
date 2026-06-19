@@ -33,6 +33,7 @@ import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
+import { relaunchWithIndexHeapIfNeeded } from './index-heap-relaunch';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
@@ -90,6 +91,11 @@ if (nodeMajor < MIN_NODE_MAJOR) {
 // passes the flag. Must run before any grammar (in the parse worker, which
 // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
 relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
+
+// Full-project indexing can exceed Node's default old-space ceiling on large
+// workspaces while resolving references. Relaunch only the index-heavy CLI
+// commands with a larger heap, preserving user-supplied node flags.
+relaunchWithIndexHeapIfNeeded(__filename);
 
 // Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
 // that reaches here escaped every boundary, so the process is in an undefined

@@ -20,7 +20,7 @@ import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
-import { validatePathWithinRoot, normalizePath } from '../utils';
+import { normalizePath, resolvePathWithinRootForIndexing } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
@@ -872,7 +872,7 @@ export class ExtractionOrchestrator {
       getAllFiles: () => files,
       getProjectRoot: () => rootDir,
       fileExists: (relativePath: string) => {
-        const full = validatePathWithinRoot(rootDir, relativePath);
+        const full = resolvePathWithinRootForIndexing(rootDir, relativePath);
         if (!full) return false;
         try {
           return fs.existsSync(full);
@@ -881,7 +881,7 @@ export class ExtractionOrchestrator {
         }
       },
       readFile: (relativePath: string) => {
-        const full = validatePathWithinRoot(rootDir, relativePath);
+        const full = resolvePathWithinRootForIndexing(rootDir, relativePath);
         if (!full) return null;
         try {
           return fs.readFileSync(full, 'utf-8');
@@ -894,10 +894,8 @@ export class ExtractionOrchestrator {
       // packages/<sub>/package.json when the root manifest is just a
       // workspace declaration). Matches the resolver-context shape.
       listDirectories: (relativePath: string) => {
-        const target =
-          relativePath === '.' || relativePath === ''
-            ? rootDir
-            : path.join(rootDir, relativePath);
+        const target = resolvePathWithinRootForIndexing(rootDir, relativePath === '.' ? '' : relativePath);
+        if (!target) return [];
         try {
           return fs
             .readdirSync(target, { withFileTypes: true })
@@ -1169,7 +1167,7 @@ export class ExtractionOrchestrator {
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, fp);
+            const fullPath = resolvePathWithinRootForIndexing(this.rootDir, fp);
             if (!fullPath) {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
@@ -1322,9 +1320,11 @@ export class ExtractionOrchestrator {
         recycleWorker();
 
         let content: string;
+        let stats: fs.Stats;
         try {
-          const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+          const fullPath = resolvePathWithinRootForIndexing(this.rootDir, filePath);
           if (!fullPath) continue;
+          stats = await fsp.stat(fullPath);
           content = await fsp.readFile(fullPath, 'utf-8');
         } catch {
           continue;
@@ -1340,7 +1340,6 @@ export class ExtractionOrchestrator {
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
-          const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
 
           const idx = errors.indexOf(errEntry);
@@ -1367,9 +1366,11 @@ export class ExtractionOrchestrator {
           recycleWorker();
 
           let fullContent: string;
+          let stats: fs.Stats;
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            const fullPath = resolvePathWithinRootForIndexing(this.rootDir, filePath);
             if (!fullPath) continue;
+            stats = await fsp.stat(fullPath);
             fullContent = await fsp.readFile(fullPath, 'utf-8');
           } catch {
             continue;
@@ -1391,7 +1392,6 @@ export class ExtractionOrchestrator {
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
             const language = detectLanguage(filePath, fullContent);
-            const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
 
             const idx = errors.indexOf(errEntry);
@@ -1475,7 +1475,7 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    const fullPath = resolvePathWithinRootForIndexing(this.rootDir, relativePath);
 
     if (!fullPath) {
       return {
@@ -1523,7 +1523,7 @@ export class ExtractionOrchestrator {
     stats: fs.Stats
   ): Promise<ExtractionResult> {
     // Prevent path traversal
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    const fullPath = resolvePathWithinRootForIndexing(this.rootDir, relativePath);
     if (!fullPath) {
       logWarn('Path traversal blocked in indexFileWithContent', { relativePath });
       return {

@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot, resolvePathWithinRootForIndexing } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -227,6 +227,16 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
   });
 
+  it('allows indexer reads through an in-repo dir symlink without weakening serving reads', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
+
+    const indexPath = resolvePathWithinRootForIndexing(root, 'escapedir/secret.txt');
+    expect(indexPath).not.toBeNull();
+    expect(fs.readFileSync(indexPath!, 'utf-8')).toContain('TOP-SECRET');
+  });
+
   it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
     if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
@@ -240,12 +250,10 @@ describe('Symlink escape prevention (#527)', () => {
     const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
     try {
       await cg.indexAll();
-      // Whether or not extraction followed the dir symlink, NO node may ever
-      // yield the out-of-root content through getCode.
-      for (const n of cg.getNodesByKind('function')) {
-        const code = await cg.getCode(n.id);
-        expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
-      }
+      const leaked = cg.getNodesByKind('function').find((n) => n.name === 'leaked');
+      expect(leaked).toBeDefined();
+      expect(leaked!.filePath).toBe('vendored/leak.ts');
+      expect(await cg.getCode(leaked!.id)).toBeNull();
     } finally {
       cg.close();
     }
