@@ -36,7 +36,7 @@ import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, crossedSizeLimit, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -3435,10 +3435,13 @@ export class ExtractionOrchestrator {
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
+      // A file indexed under a different CODEGRAPH_MAX_FILE_BYTES is not skipped:
+      // its bytes are unchanged, but what the index holds for them is not.
       if (tracked && !neverParsed) {
         try {
           const stat = fs.statSync(fullPath);
-          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt) &&
+              !crossedSizeLimit(tracked.size, tracked.contentHash, hashContent)) {
             continue;
           }
         } catch (error) {

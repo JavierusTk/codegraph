@@ -2,11 +2,42 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 
 /**
- * Largest source file CodeGraph will parse or read during resolution. Generated
- * bundles, minified sources, and dependency archives above this limit provide no
- * useful symbols; 1 MB covers essentially all hand-written source.
+ * Default for {@link MAX_SOURCE_FILE_SIZE_BYTES}. Generated bundles, minified
+ * sources, and dependency archives above this limit provide no useful symbols;
+ * 1 MB covers essentially all hand-written source.
  */
-export const MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
+export const DEFAULT_MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
+
+/**
+ * Ceiling for a `CODEGRAPH_MAX_FILE_BYTES` override. Every file under the limit
+ * is decoded to one JS string and handed whole to a WASM parser, so a limit in
+ * the hundreds of MB brings back the `Invalid string length` failures and RSS
+ * spikes the limit exists to prevent (#1910).
+ */
+const MAX_SOURCE_FILE_SIZE_CEILING_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Resolve the per-file size limit from the `CODEGRAPH_MAX_FILE_BYTES` override.
+ * Some hand-written sources do run past 1 MB (a language runtime's core unit,
+ * a generated-then-maintained data module); a positive integer raises or lowers
+ * the limit, clamped to 64 MiB. Unset, blank, or anything else keeps the default.
+ */
+export function resolveMaxSourceFileBytes(envVal: string | undefined): number {
+  if (envVal !== undefined && /^\d+$/.test(envVal.trim())) {
+    const n = Number(envVal.trim());
+    if (n > 0) return Math.min(n, MAX_SOURCE_FILE_SIZE_CEILING_BYTES);
+  }
+  return DEFAULT_MAX_SOURCE_FILE_SIZE_BYTES;
+}
+
+/**
+ * Largest source file CodeGraph will parse or read during resolution
+ * (`CODEGRAPH_MAX_FILE_BYTES`, default 1 MB). Read once per process and per
+ * worker thread, which inherit the environment, so every process that writes
+ * one index — the CLI, a daemon, an MCP server's watcher — must see the same
+ * value, or each sync re-classifies the files between the two limits.
+ */
+export const MAX_SOURCE_FILE_SIZE_BYTES = resolveMaxSourceFileBytes(process.env.CODEGRAPH_MAX_FILE_BYTES);
 
 /**
  * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
@@ -29,6 +60,22 @@ export function oversizeStamp(size: number): string {
  */
 export function indexedHashInput(size: number, content: () => string): string {
   return size > MAX_SOURCE_FILE_SIZE_BYTES ? oversizeStamp(size) : content();
+}
+
+/**
+ * Whether an indexed file sits on the wrong side of the current limit: stored
+ * as its size stamp (unread) although it now fits, or parsed although it is now
+ * over. Only a change of `CODEGRAPH_MAX_FILE_BYTES` gets a file there, and its
+ * size and mtime are unchanged, so a stat-only "unchanged" check must not skip
+ * it: the file has to be read and re-indexed under the new limit.
+ */
+export function crossedSizeLimit(
+  size: number,
+  contentHash: string,
+  hash: (text: string) => string
+): boolean {
+  const storedAsStamp = contentHash === hash(oversizeStamp(size));
+  return storedAsStamp !== size > MAX_SOURCE_FILE_SIZE_BYTES;
 }
 
 /** A source file's stats, and its bytes when they are within the limit (null = oversize). */
