@@ -260,3 +260,56 @@ describe('Pascal calls written without parentheses', () => {
     }
   });
 });
+
+describe('Pascal calls without parentheses into a unit that has copies', () => {
+  // The same unit twice: the real one and a fixture copy under a tool's tests,
+  // neither nearer the caller than the other. The copy is indexed first.
+  const UNIT = `unit ControlUsuarios;
+interface
+function IsOnPrimaryThread: Boolean;
+implementation
+function IsOnPrimaryThread: Boolean;
+begin
+  Result := True;
+end;
+end.
+`;
+  const CALLER = `unit Capa;
+interface
+uses ControlUsuarios;
+procedure Registrar;
+implementation
+procedure Registrar;
+begin
+  if not IsOnPrimaryThread then Exit;
+end;
+end.
+`;
+  let copiesRoot = '';
+  let copies: CodeGraph;
+
+  beforeAll(async () => {
+    copiesRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pascal-copies-'));
+    const write = (rel: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(copiesRoot, rel)), { recursive: true });
+      fs.writeFileSync(path.join(copiesRoot, rel), text);
+    };
+    write('Herramientas/Builder/tests/native/ControlUsuarios.pas', UNIT);
+    write('VCL/BaseMAX/ControlUsuarios.pas', UNIT);
+    write('CyberMAX/tabgen/Capa.pas', CALLER);
+    copies = await CodeGraph.init(copiesRoot, { index: true });
+  }, 60_000);
+
+  afterAll(() => {
+    copies?.close();
+    if (copiesRoot) fs.rmSync(copiesRoot, { recursive: true, force: true });
+  });
+
+  it('reach the shallowest copy when none is nearer the caller', () => {
+    const caller = copies.getNodesByName('Registrar').find((n) => n.kind === 'function')!;
+    const targets = copies.getOutgoingEdgesFrom([caller.id])
+      .filter((e: Edge) => e.kind === 'calls')
+      .map((e: Edge) => copies.getNode(e.target)!.filePath);
+    expect(targets).toEqual(['VCL/BaseMAX/ControlUsuarios.pas']);
+  });
+});

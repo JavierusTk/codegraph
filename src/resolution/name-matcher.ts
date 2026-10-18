@@ -1259,7 +1259,12 @@ export function matchPascalImplicitCall(
     target = candidates[0]!;
     confidence = 0.9;
   } else {
-    target = findBestMatch(ref, candidates, context);
+    // Copies of one unit (a tool's test fixture, an archived OLD copy) can sit
+    // equally far from the caller, and findBestMatch keeps the first of equal
+    // scores, which is index order. Copies nest deeper than the unit they copy,
+    // so offer the shallowest path first.
+    const shallowFirst = [...candidates].sort((a, b) => a.filePath.split('/').length - b.filePath.split('/').length);
+    target = findBestMatch(ref, shallowFirst, context);
     confidence = target && computePathProximity(ref.filePath, target.filePath) >= 30 ? 0.7 : 0.4;
   }
   if (!target || !isCrossFileReachable(target, ref, context)) return null;
