@@ -69,6 +69,10 @@ export function isConfigLeafNode(node: { kind: string; language?: string }): boo
  * Whether `child` is `parent` itself or sits underneath it. Case-insensitive on
  * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
  * case than the lexical root, which would otherwise false-reject a valid file.
+ *
+ * A drive or filesystem root (`W:\`, `/`) already ends with a separator, so it
+ * is not appended again: `W:\` + sep is `W:\\`, which no real path starts with,
+ * and every file of a project rooted at a drive would be rejected as an escape.
  */
 function isWithinDir(child: string, parent: string): boolean {
   let c = child;
@@ -77,7 +81,7 @@ function isWithinDir(child: string, parent: string): boolean {
     c = c.toLowerCase();
     p = p.toLowerCase();
   }
-  return c === p || c.startsWith(p + path.sep);
+  return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep);
 }
 
 /**

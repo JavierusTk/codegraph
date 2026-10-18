@@ -104,6 +104,7 @@ import path from 'path';
 import type CodeGraph from '../index';
 import type { EdgeKind, Node, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
+import { lexicalPathWithinRoot } from '../utils';
 
 // =============================================================================
 // Caps and defaults
@@ -709,8 +710,10 @@ function defaultSourceReader(cg: CodeGraph): (filePath: string) => string | null
   const root = path.resolve(cg.getProjectRoot());
   return (filePath: string): string | null => {
     try {
-      const absolute = path.resolve(root, filePath);
-      if (absolute !== root && !absolute.startsWith(root + path.sep)) return null;
+      // The shared lexical check, so a project rooted at a drive (`W:\`) is not
+      // rejected for ending in a separator already.
+      const absolute = lexicalPathWithinRoot(root, filePath);
+      if (absolute === null) return null;
       const stat = fs.statSync(absolute);
       if (!stat.isFile() || stat.size > MAX_CORROBORATION_BYTES) return null;
       return fs.readFileSync(absolute, 'utf8');

@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot, lexicalPathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -312,6 +312,32 @@ describe('Symlink escape prevention (#527)', () => {
     } finally {
       cg.close();
     }
+  });
+});
+
+describe('Containment when the project root is a drive or filesystem root', () => {
+  // A drive root (`W:\`) or POSIX root (`/`) already ends with a separator.
+  // Appending another made the containment prefix `W:\\` / `//`, which no real
+  // path starts with — so every file of a drive-root project (`codegraph init
+  // --force W:\`) was rejected as an escape and nothing indexed.
+  it.runIf(process.platform === 'win32')('accepts files under a drive root', () => {
+    expect(lexicalPathWithinRoot('W:\\', 'CyberMAX\\Source\\foo.pas')).toBe('W:\\CyberMAX\\Source\\foo.pas');
+    expect(lexicalPathWithinRoot('w:\\', 'CyberMAX/Source/foo.pas')).not.toBeNull();
+    // A path that does not exist yet passes through the realpath half too.
+    expect(validatePathWithinRoot('C:\\', 'codegraph-no-such-dir\\app.ts')).toBe('C:\\codegraph-no-such-dir\\app.ts');
+  });
+
+  it.runIf(process.platform !== 'win32')('accepts files under the filesystem root', () => {
+    expect(lexicalPathWithinRoot('/', 'project/src/app.ts')).toBe('/project/src/app.ts');
+    expect(validatePathWithinRoot('/', 'codegraph-no-such-dir/app.ts')).toBe('/codegraph-no-such-dir/app.ts');
+  });
+
+  it('still rejects traversal and sibling-prefix paths under a nested root', () => {
+    const root = path.join(os.tmpdir(), 'cg-root');
+    expect(lexicalPathWithinRoot(root, 'src/app.ts')).toBe(path.join(root, 'src', 'app.ts'));
+    expect(lexicalPathWithinRoot(root, path.join('..', 'escape', 'x.ts'))).toBeNull();
+    // `cg-root-evil` shares the name prefix but is a sibling, not a child.
+    expect(lexicalPathWithinRoot(root, `${root}-evil${path.sep}x.ts`)).toBeNull();
   });
 });
 
