@@ -3032,10 +3032,47 @@ export class ToolHandler {
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
 
-    const results = cg.searchNodes(query, {
+    let results = cg.searchNodes(query, {
       limit,
       kinds: kind ? [kind as NodeKind] : undefined,
     });
+
+    // A qualified query (`TTableMAX.Post`, `Unit.Symbol`, `mod::fn`) names its
+    // definition exactly, but full-text search tokenises the separator away and
+    // ranks that definition anywhere in the list, or past the limit. Resolve it
+    // the way codegraph_node and codegraph_callers do and put it first. A single
+    // token only: a field filter (`path:src/x`) is not a qualified name.
+    //
+    // A dot kept inside one full-text term is matched as a phrase, so a
+    // qualifier that is not the stored one (`Application.Initialize` for
+    // `TApplication::Initialize`) finds nothing. The same query with the dot
+    // split into words goes after the phrase hits, for recall. Only here:
+    // explore relies on the phrase to tell the implementation a query names
+    // from its siblings.
+    if (isQualifiedSymbol(query) && !/\s/.test(query) && !/^[a-z]+:(?!:)/i.test(query)) {
+      const named = cg.getNodesByName(lastQualifierPart(query))
+        .filter((n) => !NOT_A_DEFINITION.has(n.kind) && (!kind || n.kind === kind));
+      const exact = named.filter((n) => matchesSymbol(n, query));
+      // Next, the same name under a container that contains what was written
+      // before it (`Application` in `TApplication::Initialize`): among the
+      // thousands of `Initialize` methods of a Delphi tree, those are the ones
+      // meant, and no full-text ranking would pick them out.
+      const qualifiers = query.split(/::|[./]/).slice(0, -1).map((q) => q.toLowerCase()).filter((q) => q.length > 0);
+      const loose = named.filter((n) =>
+        !matchesSymbol(n, query) && qualifiers.every((q) => n.qualifiedName.toLowerCase().includes(q)));
+      const words = query.replace(/(\p{L})\.(?=\p{L})/gu, '$1 ');
+      const related = words !== query
+        ? cg.searchNodes(words, { limit, kinds: kind ? [kind as NodeKind] : undefined })
+        : [];
+      const seen = new Set<string>();
+      const topScore = results[0]?.score ?? related[0]?.score ?? 0;
+      const byName = [...exact, ...loose].map((node) => ({ node, score: topScore }));
+      results = [...byName, ...results, ...related].filter((r) => {
+        if (seen.has(r.node.id)) return false;
+        seen.add(r.node.id);
+        return true;
+      }).slice(0, limit);
+    }
 
     if (results.length === 0) {
       return this.textResult(`No results found for "${query}"`);
