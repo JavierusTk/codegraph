@@ -6365,10 +6365,11 @@ export class TreeSitterExtractor {
     //    (e.g. `@A class Foo {} @B class Bar {}` would otherwise
     //    attribute @A to Bar).
     //
-    //    Note on identity: tree-sitter web bindings return fresh JS
-    //    wrapper objects from `parent`/`namedChild` navigation, so
-    //    `sibling === declNode` is unreliable — `startIndex` does
-    //    the matching instead.
+    //    The walk goes sibling to sibling from the declaration itself.
+    //    Locating the declaration by index first cost one O(i) child
+    //    lookup per earlier sibling, for every declaration: cubic in a
+    //    parent holding thousands of declarations (an error-recovered
+    //    Delphi unit like Winapi.Windows.pas spent minutes here).
     //
     //    A grammar that wraps the declaration (Dart's `declaration`
     //    around a member with no body) puts the annotations before the
@@ -6376,28 +6377,12 @@ export class TreeSitterExtractor {
     //    between the annotations and the declaration (Dart) steps over them.
     const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
     const stepOver = this.extractor?.decoratorStepOverTypes;
-    const parent = anchor.parent;
-    if (parent) {
-      const declStart = anchor.startIndex;
-      let declIdx = -1;
-      for (let i = 0; i < parent.namedChildCount; i++) {
-        const sibling = parent.namedChild(i);
-        if (sibling && sibling.startIndex === declStart) {
-          declIdx = i;
-          break;
-        }
+    for (let sibling = anchor.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+      if (stepOver?.includes(sibling.type)) continue;
+      if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
+        break; // non-decorator separator → stop consuming
       }
-      if (declIdx > 0) {
-        for (let j = declIdx - 1; j >= 0; j--) {
-          const sibling = parent.namedChild(j);
-          if (!sibling) continue;
-          if (stepOver?.includes(sibling.type)) continue;
-          if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
-            break; // non-decorator separator → stop consuming
-          }
-          consider(sibling);
-        }
-      }
+      consider(sibling);
     }
   }
 
