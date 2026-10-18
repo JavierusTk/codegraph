@@ -3964,16 +3964,26 @@ export class QueryBuilder {
    * is (re)written here so rows inserted before the v8 migration get their
    * tail the first time they're attempted. A ref's own `nameTail`, when the
    * resolver gave it one, replaces the tail its name gives.
+   *
+   * A Pascal `implicit_call` is deleted instead: a name a body evaluates
+   * without parens that names no routine is a property, constant, enum member
+   * or global, almost never a routine yet to come, and parking those would
+   * keep hundreds of thousands of rows on a large Delphi tree for nothing.
    */
   markReferencesFailed(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; nameTail?: string }>): number {
     if (refs.length === 0) return 0;
     const stmt = this.db.prepare(
       "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?"
     );
+    const drop = this.db.prepare(
+      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
+    );
     let changed = 0;
     const markMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        changed += stmt.run(ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind), ref.fromNodeId, ref.referenceName, ref.referenceKind).changes;
+        changed += ref.referenceKind === 'implicit_call'
+          ? drop.run(ref.fromNodeId, ref.referenceName, ref.referenceKind).changes
+          : stmt.run(ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind), ref.fromNodeId, ref.referenceName, ref.referenceKind).changes;
       }
     });
     markMany(refs);
@@ -3986,17 +3996,21 @@ export class QueryBuilder {
    * the key-tuple variant also flips same-key sibling rows in later batches
    * to 'failed' before they were ever attempted (#1269). Resolution outcome
    * can differ per call site (receiver-type inference reads the ref's line),
-   * so a sibling must not inherit this row's failure.
+   * so a sibling must not inherit this row's failure. A Pascal `implicit_call`
+   * is deleted, as in markReferencesFailed.
    */
   markReferencesFailedByRowIds(refs: Array<{ rowId: number; referenceName: string; referenceKind: string; nameTail?: string }>): number {
     if (refs.length === 0) return 0;
     const stmt = this.db.prepare(
       "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?"
     );
+    const drop = this.db.prepare('DELETE FROM unresolved_refs WHERE id = ?');
     let changed = 0;
     const markMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        changed += stmt.run(ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind), ref.rowId).changes;
+        changed += ref.referenceKind === 'implicit_call'
+          ? drop.run(ref.rowId).changes
+          : stmt.run(ref.nameTail ?? referenceNameTail(ref.referenceName, ref.referenceKind), ref.rowId).changes;
       }
     });
     markMany(refs);

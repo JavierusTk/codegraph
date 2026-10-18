@@ -351,9 +351,13 @@ export interface ExtractionError {
  * Kinds an unresolved reference can carry. `function_ref` is internal-only —
  * a function name used as a VALUE (callback registration, #756). It never
  * becomes an edge kind: resolution maps it to a `references` edge targeting
- * function/method nodes only (see `matchFunctionRef`).
+ * function/method nodes only (see `matchFunctionRef`). `implicit_call` is
+ * internal-only too: a Pascal name evaluated without parentheses, which is a
+ * call when it names a function and a callback reference when it names a
+ * procedure, and nothing when it names anything else (see
+ * `matchPascalImplicitCall`).
  */
-export type ReferenceKind = EdgeKind | 'function_ref';
+export type ReferenceKind = EdgeKind | 'function_ref' | 'implicit_call';
 
 /**
  * A reference that couldn't be resolved during extraction

@@ -603,6 +603,16 @@ export class TreeSitterExtractor {
   // (see flushFnRefCandidates).
   private fnRefSpec: FnRefSpec | undefined;
   private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
+  // Pascal names a routine body evaluates without parentheses (see
+  // collectPascalImplicitCalls), its own locals already left out; the file's
+  // non-routine names are left out at end-of-file (flushPascalImplicitCalls).
+  private pascalImplicitCandidates: Array<{
+    fromNodeId: string;
+    name: string;
+    kind: 'calls' | 'implicit_call' | 'function_ref';
+    line: number;
+    column: number;
+  }> = [];
   // Memoized "is this a Vue store file" verdict (per-extractor = per-file).
   private vueStoreFile: boolean | null = null;
   // An object literal hung on a path (`window.App = {…}`, `ns.mod = {…}`) is
@@ -726,6 +736,7 @@ export class TreeSitterExtractor {
       // Gate + flush function-as-value candidates (#756) while the file's
       // nodes and import refs are complete and the file node is still pushed.
       this.flushFnRefCandidates();
+      this.flushPascalImplicitCalls();
       this.flushValueRefs();
 
       if (packageNodeId) this.nodeStack.pop();
@@ -7886,6 +7897,10 @@ export class TreeSitterExtractor {
     // block (begin..end) → visit for calls
     if (nodeType === 'block') {
       this.visitPascalBlock(node);
+      const callerId = this.nodeStack[this.nodeStack.length - 1];
+      if (callerId) {
+        this.collectPascalImplicitCalls(node, callerId, pascalRoutineLocals(null, null, node, this.source));
+      }
       return true;
     }
 
@@ -8108,6 +8123,7 @@ export class TreeSitterExtractor {
       this.nodeStack.push(parentId);
       this.visitPascalBlock(block);
       this.nodeStack.pop();
+      this.collectPascalImplicitCalls(block, parentId, pascalRoutineLocals(node, declProc, block, this.source));
     }
   }
 
@@ -8248,22 +8264,103 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Collect the names a Pascal routine body evaluates WITHOUT parentheses.
+   * Pascal drops the parens of a call with no arguments, so `if
+   * IsOnPrimaryThread then`, `Flag := EjecutandoSinUI` and the `dmFoo` of
+   * `dmFoo.Table.Open` are calls that parse as bare identifiers — the same
+   * shape as a variable, field or constant until resolution knows the name:
+   *  - a statement that is a bare name (`Refresh;`) can only be a procedure
+   *    call → `calls`, as if it were written with parens;
+   *  - `@Name` takes a routine's address → `function_ref` (#756);
+   *  - any other value position — a condition, an assignment's right side, an
+   *    argument, an operand, the head of a dotted chain, a `with` subject — is
+   *    an `implicit_call`, which resolution keeps only when the name is a
+   *    routine: an edge `calls` a function, and a procedure passed or assigned
+   *    as a value is a callback `references` edge.
+   * The routine's parameters and locals shadow any routine of their name and
+   * are left out here, as are `Self`/`Result`, flow intrinsics and, outside
+   * statements, names spelled like Delphi types (`TFoo`, `IFoo`, `EFoo`), which
+   * head constructor calls, casts and `is` tests. Calls with parentheses are
+   * the block walk's (visitPascalBlock), and a name after a dot is a member.
+   */
+  private collectPascalImplicitCalls(block: SyntaxNode, callerId: string, locals: ReadonlySet<string>): void {
+    const visit = (node: SyntaxNode): void => {
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (!child?.isNamed) continue;
+        if (child.type !== 'identifier') {
+          if (!PASCAL_IMPLICIT_SKIP_SUBTREES.has(child.type)) visit(child);
+          continue;
+        }
+        const kind = pascalIdentifierRole(node, node.fieldNameForChild(i));
+        if (!kind) continue;
+        const name = getNodeText(child, this.source);
+        const key = name.toLowerCase();
+        if (locals.has(key) || PASCAL_NON_ROUTINE_NAMES.has(key)) continue;
+        if (kind !== 'calls' && PASCAL_TYPE_NAME.test(name)) continue;
+        this.pascalImplicitCandidates.push({
+          fromNodeId: callerId,
+          name,
+          kind,
+          line: child.startPosition.row + 1,
+          column: child.startPosition.column,
+        });
+      }
+    };
+    visit(block);
+  }
+
+  /**
+   * Gate + flush the candidates of collectPascalImplicitCalls. A name this file
+   * declares only as something other than a routine — a field or property of
+   * its class, a unit-level var or const, an enum member, a type, a used unit —
+   * is that thing wherever the file writes it bare. One `implicit_call` or
+   * `function_ref` per caller and name is enough for callers/impact and keeps
+   * the volume down; statement calls keep every site, like paren'd calls.
+   */
+  private flushPascalImplicitCalls(): void {
+    if (this.pascalImplicitCandidates.length === 0) return;
+    const candidates = this.pascalImplicitCandidates;
+    this.pascalImplicitCandidates = [];
+
+    const routines = new Set<string>();
+    const nonRoutines = new Set<string>();
+    for (const n of this.nodes) {
+      if (n.kind === 'file') continue;
+      (n.kind === 'function' || n.kind === 'method' ? routines : nonRoutines).add(n.name.toLowerCase());
+    }
+    for (const r of this.unresolvedReferences) {
+      if (r.referenceKind === 'imports') nonRoutines.add(r.referenceName.toLowerCase());
+    }
+
+    const seen = new Set<string>();
+    for (const c of candidates) {
+      const key = c.name.toLowerCase();
+      if (nonRoutines.has(key) && !routines.has(key)) continue;
+      if (c.kind !== 'calls') {
+        const once = `${c.fromNodeId}|${c.kind}|${key}`;
+        if (seen.has(once)) continue;
+        seen.add(once);
+      }
+      this.unresolvedReferences.push({
+        fromNodeId: c.fromNodeId,
+        referenceName: c.name,
+        referenceKind: c.kind,
+        line: c.line,
+        column: c.column,
+      });
+    }
+  }
+
+  /**
    * Recursively visit a Pascal block/statement tree for call expressions
    */
   private visitPascalBlock(node: SyntaxNode): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
-      // Function-as-value capture (#756): Pascal bodies are walked here, not
-      // in visitNode/visitForCallsAndStructure, so the capture hook fires here
-      // — assignment RHS is the Delphi event-wiring idiom (`OnFire := Handler`).
-      this.maybeCaptureFnRefs(child, child.type);
       if (child.type === 'exprCall') {
         this.extractPascalCall(child);
-        // The walker doesn't descend into a call's arguments — dispatch the
-        // argument container directly (`RegisterHandler(TargetCb)` / `(@Cb)`).
-        const args = child.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
-        if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
       } else if (child.type === 'exprDot') {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
@@ -8284,6 +8381,101 @@ export class TreeSitterExtractor {
       }
     }
   }
+}
+
+/** Pascal names that are never a project routine when written bare (lowercased). */
+const PASCAL_NON_ROUTINE_NAMES: ReadonlySet<string> = new Set([
+  'self', 'result', 'nil', 'true', 'false', 'exit', 'break', 'continue',
+]);
+
+/** The Delphi type naming convention: `TFoo` classes, `IFoo` interfaces, `EFoo` exceptions. */
+const PASCAL_TYPE_NAME = /^[TIE][A-Z]/;
+
+/**
+ * Subtrees of a Pascal body that hold no value-position names: nested
+ * routines (their bodies are not this routine's), set constructors and case
+ * labels (enum constants), type positions, inline assembly and parse errors.
+ */
+const PASCAL_IMPLICIT_SKIP_SUBTREES: ReadonlySet<string> = new Set([
+  'defProc', 'declProc', 'declVars', 'declConsts', 'declTypes',
+  'exprBrackets', 'caseLabel', 'typeref', 'type', 'genericDot', 'genericTpl',
+  'asm', 'ERROR',
+]);
+
+/**
+ * What a bare identifier directly under `parent` (in `field`) is, for
+ * collectPascalImplicitCalls: a statement call, an address taken, a value the
+ * body evaluates, or not a name in scope (a member after a dot, the target of
+ * an assignment, a loop or exception variable, `inherited`'s method).
+ */
+function pascalIdentifierRole(
+  parent: SyntaxNode,
+  field: string | null
+): 'calls' | 'implicit_call' | 'function_ref' | null {
+  switch (parent.type) {
+    case 'statement':
+      return 'calls';
+    case 'exprUnary':
+      return getChildByField(parent, 'operator')?.type === 'kAt' ? 'function_ref' : 'implicit_call';
+    case 'exprCall':
+      return field === 'entity' ? null : 'implicit_call';
+    case 'assignment':
+      return field === 'lhs' ? null : 'implicit_call';
+    case 'exprDot':
+      return field === 'lhs' ? 'implicit_call' : null;
+    case 'foreach':
+      return field === 'iterator' ? null : 'implicit_call';
+    case 'exceptionHandler':
+      return field === 'variable' ? null : 'implicit_call';
+    case 'inherited':
+    case 'varAssignDef':
+    case 'goto':
+    case 'label':
+      return null;
+    default:
+      return 'implicit_call';
+  }
+}
+
+/**
+ * The names a Pascal routine declares for itself, lowercased: its parameters,
+ * its `var`/`const`/`type` sections and nested routines, and the inline `var`,
+ * `for … in` and `on E: … do` variables of its body. Bare, each one is that
+ * local, whatever routine elsewhere shares the name.
+ */
+function pascalRoutineLocals(
+  defProc: SyntaxNode | null,
+  declProc: SyntaxNode | null,
+  block: SyntaxNode,
+  source: string
+): Set<string> {
+  const locals = new Set<string>();
+  const add = (node: SyntaxNode | null | undefined): void => {
+    if (node?.type === 'identifier') locals.add(getNodeText(node, source).toLowerCase());
+  };
+  const args = declProc ? getChildByField(declProc, 'args') : null;
+  for (const arg of args?.namedChildren ?? []) {
+    if (arg?.type === 'declArg') arg.childrenForFieldName('name').forEach(add);
+  }
+  for (const section of defProc?.namedChildren ?? []) {
+    if (!section) continue;
+    if (section.type === 'defProc') {
+      const nested = section.namedChildren.find((c) => c?.type === 'declProc');
+      add(nested ? getChildByField(nested, 'name') : null);
+      continue;
+    }
+    if (section.type !== 'declVars' && section.type !== 'declConsts' && section.type !== 'declTypes') continue;
+    for (const decl of section.namedChildren) decl?.childrenForFieldName('name').forEach(add);
+  }
+  const walk = (node: SyntaxNode): void => {
+    if (node.type === 'varAssignDef') node.namedChildren.forEach(add);
+    else if (node.type === 'foreach') add(getChildByField(node, 'iterator'));
+    else if (node.type === 'exceptionHandler') add(getChildByField(node, 'variable'));
+    if (node.type === 'defProc') return;
+    for (const child of node.namedChildren) if (child) walk(child);
+  };
+  walk(block);
+  return locals;
 }
 
 

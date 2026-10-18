@@ -351,15 +351,6 @@ const LUA_SPEC: FnRefSpec = {
   layers: new Map<string, string | null>([['expression_list', null]]),
 };
 
-const PASCAL_SPEC: FnRefSpec = {
-  idTypes: new Set(['identifier']),
-  dispatch: new Map<string, CaptureRule>([
-    ['exprArgs', { mode: 'args' }],
-    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := Handler
-  ]),
-  unwrap: new Map<string, string | null>([['exprUnary', 'operand']]), // @Handler
-};
-
 /**
  * PHP core functions whose string arguments are CALLABLES — the positional
  * prior that makes a bare string trustworthy as a function reference.
@@ -416,7 +407,10 @@ export const FN_REF_SPECS: Record<string, FnRefSpec | undefined> = {
   dart: DART_SPEC,
   lua: LUA_SPEC,
   luau: LUA_SPEC,
-  pascal: PASCAL_SPEC,
+  // Pascal has no spec: a bare name in value position may be a routine passed
+  // as a value or a call without parens, and only resolution can tell, so its
+  // bodies are scanned by collectPascalImplicitCalls (tree-sitter.ts), which
+  // emits `@Name` as function_ref itself.
 };
 
 // ---------------------------------------------------------------------------

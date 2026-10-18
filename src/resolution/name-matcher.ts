@@ -1207,6 +1207,60 @@ export function matchFunctionRef(
   return null;
 }
 
+/**
+ * Resolve a Pascal `implicit_call`: a name a routine body evaluates without
+ * parentheses (collectPascalImplicitCalls in extraction/tree-sitter.ts). Only
+ * a routine makes it a dependency — a function it calls, or a procedure it
+ * hands on as a value, a callback reference like #756's. A variable, field,
+ * property, constant or type of that name gets no edge, and nor does a name no
+ * routine has. Pascal reaches a method by its bare name only through the
+ * implicit `Self`, so a method qualifies only in the caller's own class; a
+ * free function is chosen as a call written with parens chooses it (same
+ * file first, else path proximity), so `IsOnPrimaryThread` and
+ * `IsOnPrimaryThread()` land on the same definition.
+ */
+export function matchPascalImplicitCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const sep = caller?.kind === 'method' ? caller.qualifiedName.lastIndexOf('::') : -1;
+  const ownClass = caller && sep > 0 ? caller.qualifiedName.slice(0, sep).toLowerCase() : null;
+  const candidates = context.getNodesByLowerName(ref.referenceName.toLowerCase()).filter((n) => {
+    if (n.id === ref.fromNodeId || !sameLanguageFamily(n.language, ref.language)) return false;
+    if (n.kind === 'function') return isLexicallyReachable(n, ref, context);
+    if (n.kind !== 'method' || !ownClass) return false;
+    const methodSep = n.qualifiedName.lastIndexOf('::');
+    return methodSep > 0 && n.qualifiedName.slice(0, methodSep).toLowerCase() === ownClass;
+  });
+  if (candidates.length === 0 || candidates.length > AMBIGUOUS_NAME_CEILING) return null;
+
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  let target: Node | null;
+  let confidence: number;
+  if (sameFile.length > 0) {
+    target = sameFile.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    confidence = 0.9;
+  } else if (candidates.length === 1) {
+    target = candidates[0]!;
+    confidence = 0.9;
+  } else {
+    target = findBestMatch(ref, candidates, context);
+    confidence = target && computePathProximity(ref.filePath, target.filePath) >= 30 ? 0.7 : 0.4;
+  }
+  if (!target || !isCrossFileReachable(target, ref, context)) return null;
+
+  const isFunction = !!target.returnType;
+  return {
+    original: ref,
+    targetNodeId: target.id,
+    confidence,
+    resolvedBy: 'exact-match',
+    edgeKind: isFunction ? 'calls' : 'references',
+    ...(isFunction ? {} : { metadata: { fnRef: true } }),
+  };
+}
+
 /** Languages with no nested named functions: nesting in the graph is never a scope. */
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
 /** Types a function body can declare for itself. */
@@ -16857,6 +16911,10 @@ function matchReferenceInner(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+  // A Pascal name evaluated without parens is a routine or nothing.
+  if (ref.referenceKind === 'implicit_call') {
+    return matchPascalImplicitCall(ref, context);
   }
 
   // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,
