@@ -34,6 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import { NODE_KINDS } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
@@ -208,6 +209,9 @@ function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
 
 /** Kinds that name a thing without defining it in the file that holds them. */
 const NOT_A_DEFINITION = new Set(['file', 'import', 'export', 'parameter']);
+
+/** What codegraph_search looks among unless asked for import sites too. */
+const SEARCH_DEFINITION_KINDS: NodeKind[] = NODE_KINDS.filter((k) => k !== 'import' && k !== 'export');
 
 /**
  * Which indexed files define a symbol spelled like this query token?
@@ -1582,7 +1586,7 @@ const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
+    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call. Import/export sites are left out and same-file overloads come back as one entry, unless you ask otherwise.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1599,6 +1603,16 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum results (default: 10)',
           default: 10,
+        },
+        includeImports: {
+          type: 'boolean',
+          description: 'Also list import/export sites (a `uses` or `import` line that names the symbol). Default false: they answer "who imports X", not "where is X defined".',
+          default: false,
+        },
+        groupOverloads: {
+          type: 'boolean',
+          description: 'List the overloads of one symbol in one file as one entry with every signature. Default true; false lists each signature as its own result.',
+          default: true,
         },
         projectPath: projectPathProperty,
       },
@@ -3031,11 +3045,22 @@ export class ToolHandler {
     const kind = rawKind === 'type' ? 'type_alias' : rawKind;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
+    const includeImports = args.includeImports === true;
+    const groupOverloads = args.groupOverloads !== false;
+    // Folding overloads shrinks the list, so fetch more candidates for `limit`
+    // to still mean `limit` entries. Capped, so a large limit stays cheap.
+    const fetchLimit = groupOverloads ? Math.min(limit * 3, 300) : limit;
+    // An import/export node is a `uses`/`import` line that names the symbol,
+    // and it carries the whole clause as its signature. They are left out of
+    // the search itself, not dropped from its results: Delphi's
+    // `System.SysUtils` is imported as plain `SysUtils` in thousands of
+    // places, each import outranks the unit, and dropping them afterwards
+    // left nothing to show. A `kind:` filter in the query text decides alone.
+    const kinds: NodeKind[] | undefined = kind
+      ? [kind as NodeKind]
+      : !includeImports && !/(^|\s)kind:/i.test(query) ? SEARCH_DEFINITION_KINDS : undefined;
 
-    let results = cg.searchNodes(query, {
-      limit,
-      kinds: kind ? [kind as NodeKind] : undefined,
-    });
+    let results = cg.searchNodes(query, { limit: fetchLimit, kinds });
 
     // A qualified query (`TTableMAX.Post`, `Unit.Symbol`, `mod::fn`) names its
     // definition exactly, but full-text search tokenises the separator away and
@@ -3061,9 +3086,7 @@ export class ToolHandler {
       const loose = named.filter((n) =>
         !matchesSymbol(n, query) && qualifiers.every((q) => n.qualifiedName.toLowerCase().includes(q)));
       const words = query.replace(/(\p{L})\.(?=\p{L})/gu, '$1 ');
-      const related = words !== query
-        ? cg.searchNodes(words, { limit, kinds: kind ? [kind as NodeKind] : undefined })
-        : [];
+      const related = words !== query ? cg.searchNodes(words, { limit: fetchLimit, kinds }) : [];
       const seen = new Set<string>();
       const topScore = results[0]?.score ?? related[0]?.score ?? 0;
       const byName = [...exact, ...loose].map((node) => ({ node, score: topScore }));
@@ -3071,11 +3094,22 @@ export class ToolHandler {
         if (seen.has(r.node.id)) return false;
         seen.add(r.node.id);
         return true;
-      }).slice(0, limit);
+      });
+    }
+
+    // Filtered again here: a `kind:` filter in the query text bypasses the
+    // `kinds` above and can bring import sites back.
+    if (!includeImports) {
+      results = results.filter((r) => r.node.kind !== 'import' && r.node.kind !== 'export');
     }
 
     if (results.length === 0) {
-      return this.textResult(`No results found for "${query}"`);
+      const onlyImports = !includeImports && !kind
+        && cg.searchNodes(query, { limit: 1, kinds: ['import', 'export'] }).length > 0;
+      const hint = onlyImports
+        ? ` (only import/export sites matched; pass \`includeImports: true\` to list them)`
+        : '';
+      return this.textResult(`No results found for "${query}"${hint}`);
     }
 
     // Down-rank generated files within the FTS-returned set so a search
@@ -3088,8 +3122,31 @@ export class ToolHandler {
       return aGen - bGen;
     });
 
-    const formatted = this.formatSearchResults(ranked);
-    return this.answerResult(cg, this.truncateOutput(formatted), ranked.map(r => r.node.filePath));
+    // `limit` counts entries the agent reads, so it applies after grouping.
+    const entries = this.groupSearchResults(ranked, groupOverloads).slice(0, limit);
+    const formatted = this.formatSearchResults(entries);
+    return this.answerResult(cg, this.truncateOutput(formatted), entries.flat().map(r => r.node.filePath));
+  }
+
+  /**
+   * One entry per result, or — with `groupOverloads` — one entry per symbol
+   * per file, so the overloads of a Pascal or C++ function share one heading
+   * instead of each taking a slot of the limit. First-seen order, so the
+   * best-ranked overload decides where the entry sits; within an entry the
+   * signatures follow the source.
+   */
+  private groupSearchResults(results: SearchResult[], groupOverloads: boolean): SearchResult[][] {
+    if (!groupOverloads) return results.map((r) => [r]);
+    const byKey = new Map<string, SearchResult[]>();
+    for (const r of results) {
+      const key = `${r.node.filePath}|${r.node.qualifiedName}|${r.node.kind}`;
+      const entry = byKey.get(key);
+      if (entry) entry.push(r);
+      else byKey.set(key, [r]);
+    }
+    const entries = [...byKey.values()];
+    for (const entry of entries) entry.sort((a, b) => (a.node.startLine ?? 0) - (b.node.startLine ?? 0));
+    return entries;
   }
 
   /**
@@ -8421,16 +8478,26 @@ export class ToolHandler {
   // Formatting helpers (compact by default to reduce context usage)
   // =========================================================================
 
-  private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`**Search Results (${results.length} found)**`, ''];
+  private formatSearchResults(entries: SearchResult[][]): string {
+    const lines: string[] = [`**Search Results (${entries.length} found)**`, ''];
 
-    for (const result of results) {
-      const { node } = result;
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact format: one line per result with key info
-      lines.push(`**${node.name}** (${node.kind})`);
-      lines.push(`${node.filePath}${location}`);
-      if (node.signature) lines.push(`\`${node.signature}\``);
+    for (const entry of entries) {
+      const { node } = entry[0]!;
+      if (entry.length === 1) {
+        const location = node.startLine ? `:${node.startLine}` : '';
+        // Compact format: one line per result with key info
+        lines.push(`**${node.name}** (${node.kind})`);
+        lines.push(`${node.filePath}${location}`);
+        if (node.signature) lines.push(`\`${node.signature}\``);
+      } else {
+        // Overloads: one heading, then each signature at its own line.
+        lines.push(`**${node.name}** (${node.kind}) — ${entry.length} overloads`);
+        lines.push(node.filePath);
+        for (const { node: overload } of entry) {
+          const location = overload.startLine ? `:${overload.startLine}` : '';
+          lines.push(`  ${location}${overload.signature ? ` \`${overload.signature}\`` : ''}`);
+        }
+      }
       lines.push('');
     }
 
