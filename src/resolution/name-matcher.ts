@@ -1213,11 +1213,19 @@ export function matchFunctionRef(
  * a routine makes it a dependency — a function it calls, or a procedure it
  * hands on as a value, a callback reference like #756's. A variable, field,
  * property, constant or type of that name gets no edge, and nor does a name no
- * routine has. Pascal reaches a method by its bare name only through the
- * implicit `Self`, so a method qualifies only in the caller's own class; a
- * free function is chosen as a call written with parens chooses it (same
- * file first, else path proximity), so `IsOnPrimaryThread` and
- * `IsOnPrimaryThread()` land on the same definition.
+ * routine has. Which routines the name can reach is Pascal's own scoping:
+ *  - a method only of the caller's own class, through the implicit `Self`;
+ *  - a free function of the caller's unit, of System/SysInit, or of a unit
+ *    the caller's `uses` names — a function of a unit it does not use is a
+ *    namesake of the constant, property or type the name really is
+ *    (`MaxInt` in a unit that happens to declare `function MaxInt(a, b)`);
+ *  - as a call, only a routine callable with no arguments: a function whose
+ *    parameters all have defaults. A function that needs arguments, written
+ *    bare, is a procedural value at most, and that is credited only within
+ *    its own file (`List.Sort(CompareNames)`); elsewhere it is a namesake.
+ * Among those, a free function is chosen as a call written with parens
+ * chooses it (same file first, else path proximity), so `IsOnPrimaryThread`
+ * and `IsOnPrimaryThread()` land on the same definition.
  */
 export function matchPascalImplicitCall(
   ref: UnresolvedRef,
@@ -1226,9 +1234,15 @@ export function matchPascalImplicitCall(
   const caller = context.getNodeById?.(ref.fromNodeId);
   const sep = caller?.kind === 'method' ? caller.qualifiedName.lastIndexOf('::') : -1;
   const ownClass = caller && sep > 0 ? caller.qualifiedName.slice(0, sep).toLowerCase() : null;
+  let usedUnits: string[] | null = null;
   const candidates = context.getNodesByLowerName(ref.referenceName.toLowerCase()).filter((n) => {
     if (n.id === ref.fromNodeId || !sameLanguageFamily(n.language, ref.language)) return false;
-    if (n.kind === 'function') return isLexicallyReachable(n, ref, context);
+    const sameFile = n.filePath === ref.filePath;
+    if (n.returnType && !sameFile && !pascalCallableWithoutArgs(n.signature)) return false;
+    if (n.kind === 'function') {
+      if (!sameFile && !isPascalUnitInScope(n.filePath, (usedUnits ??= pascalUsedUnits(ref.filePath, context)))) return false;
+      return isLexicallyReachable(n, ref, context);
+    }
     if (n.kind !== 'method' || !ownClass) return false;
     const methodSep = n.qualifiedName.lastIndexOf('::');
     return methodSep > 0 && n.qualifiedName.slice(0, methodSep).toLowerCase() === ownClass;
@@ -1250,15 +1264,52 @@ export function matchPascalImplicitCall(
   }
   if (!target || !isCrossFileReachable(target, ref, context)) return null;
 
-  const isFunction = !!target.returnType;
+  const isCall = !!target.returnType && pascalCallableWithoutArgs(target.signature);
   return {
     original: ref,
     targetNodeId: target.id,
     confidence,
     resolvedBy: 'exact-match',
-    edgeKind: isFunction ? 'calls' : 'references',
-    ...(isFunction ? {} : { metadata: { fnRef: true } }),
+    edgeKind: isCall ? 'calls' : 'references',
+    ...(isCall ? {} : { metadata: { fnRef: true } }),
   };
+}
+
+/**
+ * Whether a Pascal routine can be called with no arguments: its signature has
+ * no parameter list, or every parameter group has a default (`(const S: string
+ * = '')`). The signature is the declaration's `(params): Result` text.
+ */
+function pascalCallableWithoutArgs(signature: string | undefined): boolean {
+  const sig = (signature ?? '').trim();
+  if (!sig.startsWith('(')) return true;
+  let depth = 0;
+  let end = sig.length;
+  for (let i = 0; i < sig.length; i++) {
+    if (sig[i] === '(') depth++;
+    else if (sig[i] === ')' && --depth === 0) { end = i; break; }
+  }
+  const params = sig.slice(1, end).trim();
+  return params === '' || params.split(';').every((group) => group.includes('='));
+}
+
+/** The units a Pascal file's `uses` clauses name, lowercased. */
+function pascalUsedUnits(filePath: string, context: ResolutionContext): string[] {
+  return context.getNodesInFile(filePath)
+    .filter((n) => n.kind === 'import')
+    .map((n) => n.name.toLowerCase());
+}
+
+/**
+ * Whether the unit a Pascal file declares (named as the file is) is in scope
+ * for a file using `usedUnits`: System and SysInit always are; any other unit
+ * when a `uses` names it, alone or under a unit scope prefix either way
+ * (`SysUtils` for `System.SysUtils`, `Winapi.Windows` for `Windows`).
+ */
+function isPascalUnitInScope(filePath: string, usedUnits: readonly string[]): boolean {
+  const unit = path.basename(filePath).replace(/\.[^.]+$/, '').toLowerCase();
+  if (unit === 'system' || unit === 'sysinit') return true;
+  return usedUnits.some((used) => used === unit || unit.endsWith(`.${used}`) || used.endsWith(`.${unit}`));
 }
 
 /** Languages with no nested named functions: nesting in the graph is never a scope. */

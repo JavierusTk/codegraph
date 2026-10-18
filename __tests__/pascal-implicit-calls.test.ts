@@ -37,9 +37,19 @@ function dmFoo: TdmFoo;
 function Tope: Integer;
 function Contador: Integer;
 function Elemento: Integer;
+function Mayor(A, B: Integer): Integer;
+function ConDefecto(const S: string = ''): Integer;
 procedure Handler;
 procedure RegistrarCallback(P: TProc);
 implementation
+function Mayor(A, B: Integer): Integer;
+begin
+  Result := A;
+end;
+function ConDefecto(const S: string = ''): Integer;
+begin
+  Result := 0;
+end;
 function TOther.Total: Integer;
 begin
   Result := 0;
@@ -77,9 +87,33 @@ end;
 end.
 `;
 
+// A unit Main does not use: its routines are out of Main's scope.
+const LEJOS = `unit Lejos;
+interface
+function Lejano: Boolean;
+implementation
+function Lejano: Boolean;
+begin
+  Result := True;
+end;
+end.
+`;
+
+// A unit under a scope prefix, which Main's uses names without it.
+const UTILES = `unit Sys.Utiles;
+interface
+function Ahora: Integer;
+implementation
+function Ahora: Integer;
+begin
+  Result := 0;
+end;
+end.
+`;
+
 const MAIN = `unit Main;
 interface
-uses Lib;
+uses Lib, Utiles;
 type
   TWorker = class
   private
@@ -91,7 +125,12 @@ type
     procedure Run(Elemento: Integer);
   end;
 procedure Suelta;
+function Comparar(A, B: Integer): Integer;
 implementation
+function Comparar(A, B: Integer): Integer;
+begin
+  Result := A - B;
+end;
 function TWorker.Total: Integer;
 begin
   Result := FCount;
@@ -111,6 +150,9 @@ begin
   Paso;
   RegistrarCallback(Handler);
   if GlobalFlag then Exit;
+  FCount := Mayor + ConDefecto + Ahora;
+  if Lejano then Exit;
+  Ordenar(Comparar);
 end;
 procedure Suelta;
 var
@@ -128,6 +170,8 @@ beforeAll(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pascal-implicit-'));
   fs.writeFileSync(path.join(root, 'Lib.pas'), LIB);
   fs.writeFileSync(path.join(root, 'Main.pas'), MAIN);
+  fs.writeFileSync(path.join(root, 'Lejos.pas'), LEJOS);
+  fs.writeFileSync(path.join(root, 'Sys.Utiles.pas'), UTILES);
   cg = await CodeGraph.init(root, { index: true });
 }, 60_000);
 
@@ -178,6 +222,22 @@ describe('Pascal calls written without parentheses', () => {
     for (const name of ['Tope', 'Contador', 'Elemento', 'GlobalFlag']) {
       expect(edges.filter((e) => e.includes(` ${name}@`))).toEqual([]);
     }
+  });
+
+  it('reach only the units the caller uses, under a scope prefix too', () => {
+    const edges = edgesFrom('Run', 'Main.pas');
+    expect(edges).toContain('calls Ahora@Sys.Utiles.pas');
+    expect(edges.filter((e) => e.includes(' Lejano@'))).toEqual([]);
+  });
+
+  it('call only a function that needs no arguments', () => {
+    const edges = edgesFrom('Run', 'Main.pas');
+    expect(edges).toContain('calls ConDefecto@Lib.pas');
+    expect(edges.filter((e) => e.includes(' Mayor@'))).toEqual([]);
+  });
+
+  it('credit a same-file function that needs arguments as a callback value', () => {
+    expect(edgesFrom('Run', 'Main.pas')).toContain('references Comparar@Main.pas (callback)');
   });
 
   it('never reach a method by its bare name from a free routine', () => {
