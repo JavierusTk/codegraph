@@ -41,6 +41,9 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
+import { once } from 'events';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -51,13 +54,15 @@ interface SpawnedServer {
 }
 
 function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  // Record the daemon candidates this launcher spawns, for the teardown.
+  const recorder = recordSpawns(cwd);
+  const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, ...recorder.args, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // #618: the daemon-attach log line is now off by default; opt the test
     // harness into it (CODEGRAPH_MCP_LOG_ATTACH=1) so the attach assertions
     // below can still observe a successful attach. A per-test env still wins.
-    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...env },
+    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...recorder.env, ...env },
   }) as ChildProcessWithoutNullStreams;
   // Swallow spawn/EPIPE errors so killing a child mid-write can't surface as an
   // unhandled error that crashes the vitest worker.
@@ -163,12 +168,6 @@ function countListeningLines(root: string): number {
   return readDaemonLog(root).split('\n').filter((l) => l.includes('[CodeGraph daemon] Listening on')).length;
 }
 
-function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
-  for (const p of procs) {
-    if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
-  }
-}
-
 async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
   return waitFor(() => !isAlive(pid), timeoutMs).then(() => true).catch(() => false);
 }
@@ -186,7 +185,17 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   afterEach(async () => {
-    killTree(...servers.map((s) => s.child));
+    // The runtime flags avoid an intermediate relaunch process. Wait for each
+    // actual server to exit before removing its Windows working directory.
+    await Promise.all(servers.map(async ({ child }) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, 'exit');
+      child.kill('SIGKILL');
+      await exited;
+    }));
+    // A losing daemon candidate can still be starting on a loaded machine.
+    // Stopping the winner first would let it take over the fixture (#1773).
+    await settleLosingCandidates(tempDir, () => readLockPid(realRoot));
     // The daemon is detached (not a tracked child) — reap it explicitly via the
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
@@ -194,13 +203,15 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot);
     if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      await waitProcessExit(daemonPid, 5000);
     }
     await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
+    removeSpawnLog(tempDir);
     // A killed process releases its handles asynchronously on Windows; under
     // full-suite load 50 ms is not always enough, so retry EPERM/EBUSY.
-    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  });
+    await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }, 45_000);
 
   it('takes over after SIGKILL even when the stale PID has been reused (#1553)', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' };
