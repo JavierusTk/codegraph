@@ -509,6 +509,9 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(isAlive(livePid!)).toBe(true);
   }, 40000);
 
+  // Records this young may belong to a daemon that has not bound its socket
+  // yet, so a missing listener proves nothing. Once they are past startup the
+  // pid was reused and the locks are cleared (the test after this one).
   it('preserves paired daemon/writer locks when their live PID may have been reused', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' };
     const first = spawnServer(tempDir, env);
@@ -542,12 +545,12 @@ describe('Shared MCP daemon (issue #411)', () => {
       pid: process.pid,
       version: CodeGraphPackageVersion,
       socketPath: getDaemonSocketPath(realRoot),
-      startedAt: Date.now() - 60_000,
+      startedAt: Date.now() - 15_000,
     });
     const staleWriterLock = JSON.stringify({
       pid: process.pid,
       mode: 'daemon',
-      startedAt: Date.now() - 60_000,
+      startedAt: Date.now() - 15_000,
     }) + '\n';
     fs.writeFileSync(daemonPath, staleDaemonLock);
     fs.writeFileSync(writerPath, staleWriterLock);
@@ -556,7 +559,8 @@ describe('Shared MCP daemon (issue #411)', () => {
     // SQLite writer against the database of the daemon we just killed.
     const before = fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'));
     fs.writeFileSync(path.join(realRoot, 'app.ts'), 'export function changedSymbol() {}\n');
-    const second = spawnServer(tempDir, env);
+    // No later daemon retries: one would find the records old enough to clear.
+    const second = spawnServer(tempDir, { ...env, CODEGRAPH_DAEMON_RETRY_MS: '0' });
     servers.push(second);
     sendInitialize(second.child, `file://${tempDir}`, 2);
     const response = await waitFor(() => findResponse(second.stdout, 2), 12000);
@@ -591,6 +595,55 @@ describe('Shared MCP daemon (issue #411)', () => {
     await waitFor(() => second.child.exitCode !== null, 5000);
     expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'))).toEqual(before);
     expect(fs.readFileSync(writerPath, 'utf8')).toBe(staleWriterLock);
+  }, 50000);
+
+  it('takes over paired daemon/writer locks once a reused PID is past startup', async () => {
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' };
+    const first = spawnServer(tempDir, env);
+    servers.push(first);
+    sendInitialize(first.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(first.stdout, 1), 10000);
+    await waitFor(() => countListeningLines(realRoot) >= 1, 10000);
+    sendMessage(first.child, {
+      jsonrpc: '2.0', id: 10, method: 'tools/call',
+      params: { name: 'codegraph_status', arguments: {} },
+    });
+    await waitFor(() => findResponse(first.stdout, 10), 10000);
+    const killedPid = readLockPid(realRoot)!;
+
+    first.child.stdin.end();
+    await waitFor(() => first.child.exitCode !== null, 5000);
+    process.kill(killedPid, 'SIGKILL');
+    expect(await waitProcessExit(killedPid, 8000)).toBe(true);
+
+    // The killed daemon wrote BOTH records with its own pid, so OS PID reuse
+    // makes both look live. Nothing listens on the socket any more.
+    const startedAt = Date.now() - 60_000;
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({
+        pid: process.pid,
+        version: CodeGraphPackageVersion,
+        socketPath: getDaemonSocketPath(realRoot),
+        startedAt,
+      }),
+    );
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'writer.pid'),
+      JSON.stringify({ pid: process.pid, mode: 'daemon', startedAt }) + '\n',
+    );
+
+    const second = spawnServer(tempDir, env);
+    servers.push(second);
+    sendInitialize(second.child, `file://${tempDir}`, 2);
+    await waitFor(() => findResponse(second.stdout, 2), 12000);
+    await waitFor(() => countListeningLines(realRoot) >= 2, 20000, 25, 'a replacement daemon to listen');
+
+    const replacementPid = readLockPid(realRoot)!;
+    expect(replacementPid).not.toBe(killedPid);
+    expect(replacementPid).not.toBe(process.pid);
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(isAlive(process.pid)).toBe(true);
   }, 50000);
 
   it('does not replace a live legacy lock with a second daemon', async () => {

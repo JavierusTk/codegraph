@@ -28,6 +28,7 @@ import {
   getDaemonSocketCandidates,
   decodeLockInfo,
   canProbeDaemonIdentity,
+  daemonSocketAbsent,
   probeDaemonIdentity,
   type DaemonLockInfo,
 } from './daemon-paths';
@@ -157,15 +158,43 @@ export async function listVerifiedDaemons(opts: { prune?: boolean } = {}): Promi
   return verified;
 }
 
-/** Remove stale artifacts while holding the project writer slot exclusively. */
+/**
+ * How old a daemon's lock records must be before a socket nobody listens on
+ * proves the daemon gone. A starting daemon takes both records moments before
+ * it binds, so only a record this old rules that window out.
+ */
+const ORPHAN_RECORD_MIN_AGE_MS = 30_000;
+
+/**
+ * Remove stale artifacts while holding the project writer slot exclusively.
+ *
+ * `orphanDaemonPid` is the pid of a daemon lock whose socket nobody listens on
+ * although the pid is alive: the OS reused the pid of a killed daemon. That
+ * daemon's own `writer.pid` names the same reused pid, so it looks live too and
+ * would refuse this cleanup forever (every later start then exits with "Could
+ * not acquire the daemon lock"). Take that one record over, and only that one.
+ */
 function cleanupDaemonArtifacts(
   root: string,
   expectedLockContents: string | null,
+  orphanDaemonPid?: number,
 ): boolean {
   // A daemon owns writer.pid before binding or relocating its socket. Claiming
   // the writer slot therefore freezes every legitimate daemon artifact writer
   // while we compare the inspected lock snapshot and clean it up.
-  if (readWriterLock(root)?.pid === process.pid) return false;
+  const writer = readWriterLock(root);
+  if (writer?.pid === process.pid) return false;
+  if (
+    orphanDaemonPid !== undefined &&
+    writer?.pid === orphanDaemonPid &&
+    writer.mode === 'daemon' &&
+    Date.now() - writer.startedAt > ORPHAN_RECORD_MIN_AGE_MS
+  ) {
+    process.stderr.write(
+      `[CodeGraph daemon] Lock records name pid ${orphanDaemonPid}, which is alive but is not the daemon (no listener on its socket; the OS reused the pid). Clearing them.\n`
+    );
+    swapWriterLock(root, orphanDaemonPid, { pid: process.pid, mode: 'cleanup', startedAt: Date.now(), ready: false });
+  }
   const claim = tryAcquireWriterLock(root, 'cleanup');
   if (claim.kind === 'taken') return false;
 
@@ -216,12 +245,18 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
     lockContents = fs.readFileSync(pidPath, 'utf8');
     info = decodeLockInfo(lockContents);
   } catch { /* missing/corrupt */ }
+  let orphanDaemonPid: number | undefined;
   if (info && isProcessAlive(info.pid)) {
     // A live legacy holder has no socket path to probe. That is inconclusive,
     // not proof of PID reuse, so preserve its lock rather than risk two writers.
     if (!canProbeDaemonIdentity(info) || await probeDaemonIdentity(info)) return false;
+    // No hello. A daemon that is merely slow still has its socket open; a lock
+    // old enough to be past startup with no listener at all is a reused pid.
+    if (Date.now() - info.startedAt > ORPHAN_RECORD_MIN_AGE_MS && await daemonSocketAbsent(info)) {
+      orphanDaemonPid = info.pid;
+    }
   }
-  return cleanupDaemonArtifacts(root, lockContents);
+  return cleanupDaemonArtifacts(root, lockContents, orphanDaemonPid);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

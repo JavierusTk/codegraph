@@ -119,6 +119,42 @@ export function canProbeDaemonIdentity(info: DaemonLockInfo): boolean {
 }
 
 /**
+ * Is NOBODY listening on the lock's socket? True only when the connect itself
+ * is refused (`ENOENT`: the pipe/socket is gone; `ECONNREFUSED`: a leftover
+ * socket file with no listener). A daemon that is alive but slow to answer its
+ * hello still accepts the connection, so it never reads as absent; a timeout
+ * or any other error is inconclusive and reads as "not absent".
+ */
+export function daemonSocketAbsent(info: DaemonLockInfo, timeoutMs = 1_000): Promise<boolean> {
+  if (!canProbeDaemonIdentity(info)) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    let socket: net.Socket;
+    let done = false;
+    const finish = (absent: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(absent);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    try {
+      socket = net.createConnection(info.socketPath);
+    } catch {
+      clearTimeout(timer);
+      resolve(false);
+      return;
+    }
+    socket.on('connect', () => finish(false));
+    socket.on('error', (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      finish(code === 'ENOENT' || code === 'ECONNREFUSED');
+    });
+  });
+}
+
+/**
  * Verify that the process named by a lockfile is the CodeGraph daemon serving
  * its socket. A bare PID liveness probe is insufficient because OSes reuse PIDs
  * after an OOM/SIGKILL (#1553).
